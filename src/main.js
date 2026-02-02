@@ -6,8 +6,16 @@ class SiteSleuth {
         this.chatMessages = document.getElementById("chatMessages");
         this.isProcessing = false;
         this.apiKey = null;
+        this.loadingMessageId = null;
 
         this.init();
+    }
+
+    // Escape HTML to prevent XSS attacks
+    escapeHtml(text) {
+        const div = document.createElement("div");
+        div.textContent = text;
+        return div.innerHTML;
     }
     async init() {
         this.setupEventListeners();
@@ -24,7 +32,7 @@ class SiteSleuth {
                 return result.geminiApiKey;
             }
         } catch (error) {
-            console.log("Could not retrieve API key from storage:", error);
+            // Storage access failed, will prompt user
         }
 
         // Fallback: prompt user for API key
@@ -36,8 +44,8 @@ class SiteSleuth {
                 await chrome.storage.sync.set({ geminiApiKey: apiKey });
                 return apiKey;
             } catch (error) {
-                console.error("Could not store API key:", error);
-                return apiKey; // Still return it for this session
+                // Storage failed but we can still use the key for this session
+                return apiKey;
             }
         }
 
@@ -48,8 +56,7 @@ class SiteSleuth {
             this.apiKey = await this.getGeminiApiKey();
             return true;
         } catch (error) {
-            console.error("Failed to initialize Gemini:", error);
-            this.addMessage("Failed to initialize Gemini AI. Please check your API key.", "bot");
+            this.addMessage("Failed to initialize Gemini AI. Please reload the extension and enter a valid API key.", "bot");
             return false;
         }
     }
@@ -67,34 +74,58 @@ class SiteSleuth {
         this.addMessage("Hello! I can help you find websites from your browsing history. Just describe what you're looking for and I'll analyze your recent visits to find the most relevant links.", "bot");
     }
 
-    addMessage(text, type, links = null) {
+    addMessage(text, type, links = null, messageId = null) {
         const messageDiv = document.createElement("div");
         messageDiv.className = `message ${type}`;
+        if (messageId) {
+            messageDiv.id = messageId;
+        }
 
         if (type === "bot" && links && links.length > 0) {
-            // Format bot message with links
-            let linksHTML = '<div style="margin-top: 12px;">';
-            links.forEach((link, index) => {
-                linksHTML += `
-                    <div style="margin-bottom: 8px; padding: 8px; background: rgba(181, 116, 147, 0.1); border-radius: 8px;">
-                        <a href="${link.url}" target="_blank" style="color: #e8c2d4; text-decoration: none; font-weight: 500;">
-                            ${link.title || "Untitled"}
-                        </a>
-                        <div style="font-size: 0.8rem; color: rgba(181, 116, 147, 0.8); margin-top: 4px;">
-                            ${link.url}
-                        </div>
-                        ${link.reason ? `<div style="font-size: 0.85rem; color: rgba(181, 116, 147, 0.9); margin-top: 4px; font-style: italic;">${link.reason}</div>` : ""}
-                    </div>
-                `;
+            // Format bot message with links - escape all user content
+            const linksContainer = document.createElement("div");
+            linksContainer.style.marginTop = "12px";
+
+            links.forEach((link) => {
+                const linkDiv = document.createElement("div");
+                linkDiv.style.cssText = "margin-bottom: 8px; padding: 8px; background: rgba(181, 116, 147, 0.1); border-radius: 8px;";
+
+                const anchor = document.createElement("a");
+                anchor.href = link.url;
+                anchor.target = "_blank";
+                anchor.style.cssText = "color: #e8c2d4; text-decoration: none; font-weight: 500;";
+                anchor.textContent = link.title || "Untitled";
+
+                const urlDiv = document.createElement("div");
+                urlDiv.style.cssText = "font-size: 0.8rem; color: rgba(181, 116, 147, 0.8); margin-top: 4px;";
+                urlDiv.textContent = link.url;
+
+                linkDiv.appendChild(anchor);
+                linkDiv.appendChild(urlDiv);
+
+                if (link.reason) {
+                    const reasonDiv = document.createElement("div");
+                    reasonDiv.style.cssText = "font-size: 0.85rem; color: rgba(181, 116, 147, 0.9); margin-top: 4px; font-style: italic;";
+                    reasonDiv.textContent = link.reason;
+                    linkDiv.appendChild(reasonDiv);
+                }
+
+                linksContainer.appendChild(linkDiv);
             });
-            linksHTML += "</div>";
-            messageDiv.innerHTML = `<p>${text}</p>${linksHTML}`;
+
+            const textP = document.createElement("p");
+            textP.textContent = text;
+            messageDiv.appendChild(textP);
+            messageDiv.appendChild(linksContainer);
         } else {
-            messageDiv.innerHTML = `<p>${text}</p>`;
+            const textP = document.createElement("p");
+            textP.textContent = text;
+            messageDiv.appendChild(textP);
         }
 
         this.chatMessages.appendChild(messageDiv);
         this.scrollToBottom();
+        return messageDiv;
     }
 
     scrollToBottom() {
@@ -112,8 +143,9 @@ class SiteSleuth {
         this.addMessage(query, "user");
         this.messageInput.value = "";
 
-        // Add loading message
-        const loadingMessage = this.addMessage("Analyzing your browsing history...", "bot");
+        // Add loading message with unique ID
+        this.loadingMessageId = "loading-" + Date.now();
+        this.addMessage("Analyzing your browsing history...", "bot", null, this.loadingMessageId);
 
         try {
             // Get browser history
@@ -126,7 +158,7 @@ class SiteSleuth {
             }
 
             // Update loading message
-            this.updateLastMessage("Found " + historyData.length + " recent visits. Analyzing with Gemini...");
+            this.updateLoadingMessage("Found " + historyData.length + " recent visits. Analyzing with Gemini...");
 
             // Analyze with Gemini
             const results = await this.analyzeWithGemini(query, historyData);
@@ -140,9 +172,15 @@ class SiteSleuth {
                 this.addMessage("I couldn't find any relevant websites in your browsing history for that query. Try rephrasing your request or check if you've visited related sites recently.", "bot");
             }
         } catch (error) {
-            console.error("Error processing request:", error);
             this.removeLoadingMessage();
-            this.addMessage("Sorry, there was an error processing your request. Please try again.", "bot");
+            const errorMsg = error.message || "Unknown error";
+            if (errorMsg.includes("API")) {
+                this.addMessage("There was an issue with the Gemini API. Please check your API key is valid and try again.", "bot");
+            } else if (errorMsg.includes("network") || errorMsg.includes("fetch")) {
+                this.addMessage("Network error. Please check your internet connection and try again.", "bot");
+            } else {
+                this.addMessage("Sorry, there was an error processing your request. Please try again.", "bot");
+            }
         } finally {
             this.isProcessing = false;
             this.messageInput.disabled = false;
@@ -150,22 +188,25 @@ class SiteSleuth {
         }
     }
 
-    updateLastMessage(text) {
-        const messages = this.chatMessages.querySelectorAll(".message.bot");
-        if (messages.length > 0) {
-            const lastMessage = messages[messages.length - 1];
-            lastMessage.innerHTML = `<p>${text}</p>`;
+    updateLoadingMessage(text) {
+        if (this.loadingMessageId) {
+            const loadingMessage = document.getElementById(this.loadingMessageId);
+            if (loadingMessage) {
+                loadingMessage.textContent = "";
+                const textP = document.createElement("p");
+                textP.textContent = text;
+                loadingMessage.appendChild(textP);
+            }
         }
     }
 
     removeLoadingMessage() {
-        const messages = this.chatMessages.querySelectorAll(".message.bot");
-        if (messages.length > 0) {
-            const lastMessage = messages[messages.length - 1];
-            const text = lastMessage.textContent;
-            if (text.includes("Analyzing") || text.includes("Found")) {
-                lastMessage.remove();
+        if (this.loadingMessageId) {
+            const loadingMessage = document.getElementById(this.loadingMessageId);
+            if (loadingMessage) {
+                loadingMessage.remove();
             }
+            this.loadingMessageId = null;
         }
     }
     async getBrowserHistory() {
@@ -202,35 +243,30 @@ class SiteSleuth {
     }
     async analyzeWithGemini(query, historyData) {
         try {
-            this.updateLastMessage("Step 1/2: AI filtering most relevant pages from your history...");
+            this.updateLoadingMessage("Step 1/2: AI filtering most relevant pages from your history...");
 
             // Step 1: AI pre-filtering to get most promising candidates
             const candidates = await this.aiFilterCandidates(query, historyData);            if (candidates.length === 0) {
                 return this.fallbackAnalysis(query, historyData);
             }
 
-            this.updateLastMessage(`Step 2/2: Using Google Search grounding to enhance analysis with real-time web content...`);
+            this.updateLoadingMessage(`Step 2/2: Using Google Search grounding to enhance analysis with real-time web content...`);
 
             // Step 2: Use Google Search grounding for enhanced, real-time analysis
             const finalResults = await this.groundedAnalysis(query, candidates);
 
             return finalResults;
         } catch (error) {
-            console.error("Error in advanced analysis:", error);
             // Fallback to simple analysis
             return this.fallbackAnalysis(query, historyData);
         }
     }
     async aiFilterCandidates(query, historyData) {
         try {
-            console.log(`Filtering ${historyData.length} history items for query: "${query}"`);
-
             // Step 1: Smart keyword-based pre-filtering
             const keywordFiltered = this.smartKeywordFilter(query, historyData);
-            console.log(`Keyword filtering found ${keywordFiltered.length} potential matches`);
 
             if (keywordFiltered.length === 0) {
-                console.log("No keyword matches, falling back to recent popular sites");
                 return historyData.slice(0, 20); // Return most recent/popular as fallback
             }
 
@@ -243,7 +279,6 @@ class SiteSleuth {
                 return keywordFiltered.slice(0, 35);
             }
         } catch (error) {
-            console.error("Error in AI filtering:", error);
             // Emergency fallback: smart keyword filter only
             return this.smartKeywordFilter(query, historyData).slice(0, 20);
         }
@@ -253,17 +288,14 @@ class SiteSleuth {
             .toLowerCase()
             .split(/\s+/)
             .filter((word) => word.length > 2);
-        console.log("Query words:", queryWords);
 
         // Extract key concepts from the query
         const concepts = this.extractConcepts(query);
-        console.log("Extracted concepts:", concepts);
 
         const scored = historyData.map((item) => {
             let score = 0;
             const titleLower = item.title.toLowerCase();
             const urlLower = item.url.toLowerCase();
-            const combined = `${titleLower} ${urlLower}`;
 
             // Check if item matches ALL key concepts (more strict)
             let conceptMatches = 0;
@@ -272,7 +304,6 @@ class SiteSleuth {
                 concept.keywords.forEach((keyword) => {
                     if (titleLower.includes(keyword) || urlLower.includes(keyword)) {
                         conceptFound = true;
-                        console.log(`Found concept "${concept.name}" via keyword "${keyword}" in "${item.title}"`);
                     }
                 });
                 if (conceptFound) {
@@ -284,7 +315,6 @@ class SiteSleuth {
             // Require multiple concepts to match for complex queries
             if (concepts.length > 1 && conceptMatches < 2) {
                 score *= 0.1; // Heavy penalty if not matching multiple concepts
-                console.log(`Penalty applied to "${item.title}" - only ${conceptMatches}/${concepts.length} concepts matched`);
             }
 
             // Additional scoring for exact word matches
@@ -308,121 +338,95 @@ class SiteSleuth {
             score += this.getDomainScore(item.url, concepts);
 
             return { ...item, score };
-        });        // Filter and sort by score (STRICT FILTERING)
-        const filtered = scored.filter((item) => {
-            if (item.score <= 0) {
-                console.log(`❌ EXCLUDED (score: ${item.score}): ${item.title} - ${item.url}`);
-                return false;
-            }
-            console.log(`✅ INCLUDED (score: ${item.score}): ${item.title} - ${item.url}`);
-            return true;
-        }).sort((a, b) => b.score - a.score);
+        });
 
-        console.log(
-            "Top scored items:",
-            filtered.slice(0, 10).map((item) => ({
-                title: item.title,
-                url: item.url,
-                score: item.score.toFixed(2),
-            }))
-        );
+        // Filter and sort by score (STRICT FILTERING)
+        const filtered = scored
+            .filter((item) => item.score > 0)
+            .sort((a, b) => b.score - a.score);
 
         return filtered;
-    }    extractConcepts(query) {
+    }
+
+    extractConcepts(query) {
         const lowerQuery = query.toLowerCase();
-        const concepts = [];        // Platform-specific concepts (very important)
-        if (lowerQuery.match(/reddit|r\/|subreddit/)) {
-            concepts.push({
-                name: "reddit",
-                keywords: ["reddit", "r/", "subreddit", "reddit.com"],
-                weight: 25, // Very high weight for platform-specific requests
-                isPlatform: true, // Mark as platform-specific
-            });
+        const concepts = [];
+
+        // Platform-specific concepts - these are important for filtering
+        const platformPatterns = {
+            reddit: { pattern: /reddit|r\/|subreddit/, keywords: ["reddit", "r/", "subreddit", "reddit.com"], weight: 25 },
+            youtube: { pattern: /youtube|youtu\.be/, keywords: ["youtube", "youtu.be"], weight: 22 },
+            twitter: { pattern: /twitter|x\.com|tweet/, keywords: ["twitter", "x.com", "tweet", "t.co"], weight: 22 },
+            github: { pattern: /github|gh\s/, keywords: ["github", "github.com"], weight: 22 },
+            stackoverflow: { pattern: /stackoverflow|stack overflow/, keywords: ["stackoverflow", "stack overflow"], weight: 20 },
+            linkedin: { pattern: /linkedin/, keywords: ["linkedin", "linkedin.com"], weight: 18 },
+            medium: { pattern: /medium\.com|medium article/, keywords: ["medium", "medium.com"], weight: 18 },
+            wikipedia: { pattern: /wikipedia|wiki/, keywords: ["wikipedia", "wiki"], weight: 15 },
+        };
+
+        // Check for platform matches
+        for (const [name, config] of Object.entries(platformPatterns)) {
+            if (lowerQuery.match(config.pattern)) {
+                concepts.push({
+                    name,
+                    keywords: config.keywords,
+                    weight: config.weight,
+                    isPlatform: true,
+                });
+            }
         }
 
-        if (lowerQuery.match(/youtube|yt|video/)) {
-            concepts.push({
-                name: "youtube",
-                keywords: ["youtube", "youtu.be", "yt", "video", "watch"],
-                weight: 22,
-                isPlatform: true,
-            });
+        // Category patterns for common content types
+        const categoryPatterns = {
+            video: { pattern: /video|watch|stream/, keywords: ["video", "watch", "stream", "player"], weight: 15 },
+            article: { pattern: /article|blog|post|read/, keywords: ["article", "blog", "post", "read", "news"], weight: 12 },
+            tutorial: { pattern: /tutorial|guide|how to|learn/, keywords: ["tutorial", "guide", "how", "learn", "course"], weight: 14 },
+            documentation: { pattern: /docs|documentation|reference|api/, keywords: ["docs", "documentation", "reference", "api"], weight: 14 },
+            shopping: { pattern: /buy|shop|price|store|amazon|ebay/, keywords: ["buy", "shop", "price", "store", "cart", "order"], weight: 12 },
+            recipe: { pattern: /recipe|cook|food|meal/, keywords: ["recipe", "cook", "food", "meal", "ingredient"], weight: 12 },
+            news: { pattern: /news|headline|breaking/, keywords: ["news", "headline", "breaking", "report"], weight: 12 },
+        };
+
+        for (const [name, config] of Object.entries(categoryPatterns)) {
+            if (lowerQuery.match(config.pattern)) {
+                concepts.push({
+                    name,
+                    keywords: config.keywords,
+                    weight: config.weight,
+                });
+            }
         }
 
-        if (lowerQuery.match(/twitter|x\.com|tweet/)) {
-            concepts.push({
-                name: "twitter",
-                keywords: ["twitter", "x.com", "tweet", "t.co"],
-                weight: 22,
-                isPlatform: true,
-            });
-        }
+        // Extract meaningful words from the query as generic concepts
+        // Filter out common stop words
+        const stopWords = new Set([
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "with", "by", "from", "that", "this", "was", "were", "is", "are",
+            "been", "being", "have", "has", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "can", "about", "which",
+            "what", "where", "when", "who", "how", "why", "i", "me", "my", "you",
+            "your", "we", "our", "they", "their", "it", "its", "some", "any",
+            "find", "show", "looking", "want", "need", "saw", "visited", "remember"
+        ]);
 
-        // Technology concepts
-        if (lowerQuery.match(/chatbot|bot|ai|assistant|ask|question/)) {
-            concepts.push({
-                name: "chatbot",
-                keywords: ["chatbot", "bot", "ai", "assistant", "chat", "ask", "question", "answers", "perplexity"],
-                weight: 16,
-            });
-        }
+        const words = lowerQuery
+            .split(/\s+/)
+            .filter((word) => word.length > 2 && !stopWords.has(word));
 
-        // Media/content concepts
-        if (lowerQuery.match(/wallpaper|background|desktop|screen|image|picture|photo/)) {
-            concepts.push({
-                name: "wallpaper",
-                keywords: ["wallpaper", "wallpapers", "background", "backgrounds", "desktop", "screen", "image", "images", "picture", "pictures", "photo", "photos"],
-                weight: 15,
-            });
-        }
-
-        // Franchise/character concepts
-        if (lowerQuery.match(/arcane|jinx|vi|caitlyn|ekko|jayce|viktor|piltover|zaun/)) {
-            concepts.push({
-                name: "arcane",
-                keywords: ["arcane", "jinx", "vi", "caitlyn", "ekko", "jayce", "viktor", "piltover", "zaun", "league", "legends"],
-                weight: 15,
-            });
-        }
-
-        // Technology concepts
-        if (lowerQuery.match(/code|programming|javascript|python|react|node|github|tutorial/)) {
-            concepts.push({
-                name: "programming",
-                keywords: ["code", "coding", "programming", "javascript", "python", "react", "node", "github", "tutorial", "developer", "dev"],
-                weight: 12,
-            });
-        }
-
-        // Art/design concepts
-        if (lowerQuery.match(/art|design|artwork|fanart|drawing|illustration/)) {
-            concepts.push({
-                name: "art",
-                keywords: ["art", "artwork", "fanart", "drawing", "illustration", "design", "artist", "deviantart", "artstation"],
-                weight: 12,
-            });
-        }
-
-        // Gaming concepts
-        if (lowerQuery.match(/game|gaming|steam|epic|riot|league/)) {
-            concepts.push({
-                name: "gaming",
-                keywords: ["game", "gaming", "steam", "epic", "riot", "league", "pc", "console"],
-                weight: 10,
-            });
-        }
-
-        // If no specific concepts found, create generic ones from keywords
-        if (concepts.length === 0) {
-            const words = lowerQuery.split(/\s+/).filter((word) => word.length > 3);
-            words.forEach((word) => {
+        // Add remaining words as keyword concepts
+        words.forEach((word) => {
+            // Skip if already covered by a platform or category
+            const alreadyCovered = concepts.some(c =>
+                c.keywords.some(k => k.includes(word) || word.includes(k))
+            );
+            if (!alreadyCovered) {
                 concepts.push({
                     name: word,
                     keywords: [word],
-                    weight: 8,
+                    weight: 10,
                 });
-            });
-        }
+            }
+        });
 
         return concepts;
     }    getDomainScore(url, concepts) {
@@ -448,31 +452,26 @@ class SiteSleuth {
                     if (platformMap[platform.name] && platformMap[platform.name].some(d => domain.includes(d))) {
                         score += 100; // MASSIVE bonus for correct platform
                         platformMatch = true;
-                        console.log(`✅ Platform MATCH for ${domain} - user requested ${platform.name}`);
                     }
                 });
-                
+
                 // COMPLETE EXCLUSION if wrong platform when platform was specified
                 if (!platformMatch) {
-                    score = -1000; // Exclude completely
-                    console.log(`❌ Platform MISMATCH - EXCLUDING ${domain} (user wanted ${requestedPlatforms.map(p => p.name).join(', ')})`);
-                    return score;
+                    return -1000; // Exclude completely
                 }
             }
 
             // HEAVY penalties for wrong platforms when they appear
             const allPlatformDomains = Object.values(platformMap).flat();
             const isWrongPlatform = allPlatformDomains.some(platformDomain => domain.includes(platformDomain));
-            
+
             if (isWrongPlatform && requestedPlatforms.length > 0) {
                 // This is a platform domain but not the requested one
-                const matchesRequested = requestedPlatforms.some(platform => 
+                const matchesRequested = requestedPlatforms.some(platform =>
                     platformMap[platform.name] && platformMap[platform.name].some(d => domain.includes(d))
                 );
                 if (!matchesRequested) {
-                    score = -1000; // Complete exclusion
-                    console.log(`❌ WRONG PLATFORM - EXCLUDING ${domain}`);
-                    return score;
+                    return -1000; // Complete exclusion
                 }
             }
 
@@ -502,7 +501,6 @@ class SiteSleuth {
                     relevantDomains[concept.name].forEach((keyword) => {
                         if (domain.includes(keyword)) {
                             score += 12;
-                            console.log(`Domain bonus for ${domain} matching concept ${concept.name}`);
                         }
                     });
                 }
@@ -551,22 +549,22 @@ Return 10-20 numbers max.
                         .slice(0, 20);
                 }
             } catch (parseError) {
-                console.error("Error parsing AI ranking:", parseError);
+                // JSON parsing failed, use fallback
             }
 
             // Fallback: return candidates as-is
             return candidates.slice(0, 20);
         } catch (error) {
-            console.error("Error in AI ranking:", error);
             return candidates.slice(0, 20);
         }
     }
 
     async callSimpleGeminiAPI(prompt) {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${this.apiKey}`, {
+        const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
+                "x-goog-api-key": this.apiKey,
             },
             body: JSON.stringify({
                 contents: [
@@ -582,7 +580,8 @@ Return 10-20 numbers max.
         });
 
         if (!response.ok) {
-            throw new Error(`API call failed: ${response.status}`);
+            const errorText = await response.text();
+            throw new Error(`API call failed: ${response.status} - ${errorText}`);
         }
 
         const responseData = await response.json();
@@ -651,23 +650,20 @@ Only return the JSON array, no additional text.
                     throw new Error("Invalid response format");
                 }
             } catch (parseError) {
-                console.error("Error parsing grounded analysis response:", parseError);
-                console.log("Raw response:", response.text);
-
                 // Fallback to simple candidate analysis
                 return this.candidateBasedFallback(query, candidates);
             }
         } catch (error) {
-            console.error("Error in grounded analysis:", error);
             return this.candidateBasedFallback(query, candidates);
         }
     }
 
     async callGeminiAPIWithGrounding(prompt) {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${this.apiKey}`, {
+        const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
+                "x-goog-api-key": this.apiKey,
             },
             body: JSON.stringify({
                 contents: [
@@ -688,7 +684,8 @@ Only return the JSON array, no additional text.
         });
 
         if (!response.ok) {
-            throw new Error(`API call failed: ${response.status}`);
+            const errorText = await response.text();
+            throw new Error(`API call failed: ${response.status} - ${errorText}`);
         }
 
         const responseData = await response.json();
